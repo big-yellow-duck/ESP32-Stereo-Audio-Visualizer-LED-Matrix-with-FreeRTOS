@@ -320,12 +320,38 @@ void mode_palette_control(uint8_t choice){
   switch (choice)
   {
   case 0:
-    for(uint8_t i=0,i<6,i++){
-      leds[0][leds_arr[10][i]] = ColorFromPalette(palettes_arr[palette_index], i*6 + hue, brightness, LINEARBLEND);
+    for(uint8_t j=0; j<10; j++){
+      for(uint8_t i=0; i<5; i++){
+        if(j == (9 or 7 or 6 or 4 or 3))
+        leds[0][leds_arr[j][i]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+      }
+      if(j == 8){
+        leds[0][leds_arr[j][3]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+      }
+      if(j == (5 or 2)){
+        leds[0][leds_arr[j][4]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+        leds[0][leds_arr[j][0]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+      }
+      if(j == 1){
+        leds[0][leds_arr[j][1]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+        leds[0][leds_arr[j][2]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+        leds[0][leds_arr[j][3]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
+      }
+    }  
+
+    for(uint8_t i=0; i<10; i++){
+      if(i == (0 or 6)){
+        for(uint8_t j=0; j<4; j++){
+          leds[i][leds_arr[i][j]] = ColorFromPalette(palettes_arr[palette_index], i*6 + hue, brightness, LINEARBLEND);
+        }
+      }
+
     }
-    
-    break;
+  break;
   
+  case 1:
+
+  break;
   default:
     break;
   }
