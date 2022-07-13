@@ -16,10 +16,12 @@
 #define touch2 33
 #define touch3 27
 
+#define mapping_max_val 2000;
+
 static const uint8_t max_brightness=190;
 static const uint8_t min_brightness=2;
 
-static TaskHandle_t rainbow_handle, ISR_handler_handle, spi_handle, fill_white_lights_handle;
+static TaskHandle_t normal_vis_handle, ISR_handler_handle, spi_handle, fill_white_lights_handle, fft_handle;
 static TimerHandle_t touch1_timer, touch2_timer, touch3_timer, hue_timer, mapping_decay_timer, peak_decay_timer;
 
 float fft_input_ch0[FFT_N]; //input array for fft calculations
@@ -32,12 +34,17 @@ typedef struct spi_out{
   float spi_out_ch1[FFT_N];
 }spi_out;
 
-uint_fast16_t amplitude[2][10], old_amplitude[2][10];
+
+typedef struct fft_out{
+  uint_fast16_t post_process[2][10];
+}fft_out;
+
 
 ESP_fft fft_ch0(FFT_N, SAMPLEFREQ, FFT_REAL, FFT_FORWARD, fft_input_ch0, fft_output_ch0);
 ESP_fft fft_ch1(FFT_N, SAMPLEFREQ, FFT_REAL, FFT_FORWARD, fft_input_ch1, fft_output_ch1);
 
-uint16_t bands[10] = {1,3,6,13,20,26,32,40,52,64}; //156.25, 468.75, 973.5, 2031.25, 3125, 4062.5, 5000, 6250, 8125, 10000, (Frequencies to analyse)
+uint16_t bands[10] = {1,3,6,13,20,26,32,40,52,64}; //78.125, 234.375, 468.75, 1015.625, 1562.5, 2031.25, 2500, 3125, 4062.5, 5000 (Frequencies to analyse)
+
 uint16_t mapping_max =2000;
 
 static const int spiClk =8000000; //8 MHZ SPI CLock
@@ -48,7 +55,7 @@ static uint8_t received_ch0[2];
 static uint8_t received_ch1[2];
 
 //create queue to hold fft input buffer
-QueueHandle_t fft_in_queue;
+QueueHandle_t fft_in_queue, fft_out_queue;
 
 
 //define the pins that will be used to interface the components of the project
@@ -78,6 +85,8 @@ bool long_press3 = true;
 bool brightness_control_flag = false;
 bool modePalette_control_flag = false;
 
+static bool hue_timer_change_peiod_flag = false;
+
 static int touch1_time, touch2_time, touch3_time;
 
 uint8_t hue = 0;
@@ -88,7 +97,14 @@ uint8_t palette_index = 2;
 //create the structure that will be be used to address the leds
 static CRGB leds[2][num_leds];
 
+DEFINE_GRADIENT_PALETTE(heat_colors){
+  0,  0,0,255,
+  127,255,0,0,
+  255,255,255,40
+};
+
 CRGBPalette16 palettes_arr[] ={
+  //standard rainbow palette
   RainbowColors_p,
   //bb palette 1
   CRGBPalette16(CRGB(255, 0, 84),
@@ -129,7 +145,9 @@ CRGBPalette16 palettes_arr[] ={
                 CRGB(255, 100, 100),
                 CRGB(255, 100, 100),
                 CRGB(255, 0, 0),
-                CRGB(255, 0, 0))
+                CRGB(255, 0, 0)),
+
+  heat_colors            
 };
 
 /* sort the leds into rows and columns for easy addressing 
@@ -316,46 +334,6 @@ void nine(uint8_t lr, uint8_t pos){
   }
 }
 
-void mode_palette_control(uint8_t choice){
-  switch (choice)
-  {
-  case 0:
-    for(uint8_t j=0; j<10; j++){
-      for(uint8_t i=0; i<5; i++){
-        if(j == (9 or 7 or 6 or 4 or 3))
-        leds[0][leds_arr[j][i]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-      }
-      if(j == 8){
-        leds[0][leds_arr[j][3]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-      }
-      if(j == (5 or 2)){
-        leds[0][leds_arr[j][4]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-        leds[0][leds_arr[j][0]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-      }
-      if(j == 1){
-        leds[0][leds_arr[j][1]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-        leds[0][leds_arr[j][2]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-        leds[0][leds_arr[j][3]] = ColorFromPalette(palettes_arr[palette_index], j*6 + hue, brightness, LINEARBLEND);
-      }
-    }  
-
-    for(uint8_t i=0; i<10; i++){
-      if(i == (0 or 6)){
-        for(uint8_t j=0; j<4; j++){
-          leds[i][leds_arr[i][j]] = ColorFromPalette(palettes_arr[palette_index], i*6 + hue, brightness, LINEARBLEND);
-        }
-      }
-
-    }
-  break;
-  
-  case 1:
-
-  break;
-  default:
-    break;
-  }
-}
 //function to clear 1 array of leds
 void clear_leds(uint8_t led_arr_lr){
   fill_solid(leds[led_arr_lr],num_leds,CHSV(0,0,0));
@@ -512,6 +490,74 @@ void brightness_control(uint8_t choice){
   }
 }
 
+void mode_palette_control(uint8_t choice){
+  clear_leds(0);
+  clear_leds(1);
+  
+  switch (choice)
+  {
+  case 0:
+    for(uint8_t j=0; j<10; j++){
+      if(j == 9 or j == 7 or j == 6 or j == 4 or j== 3){
+      for(uint8_t i=0; i<5; i++){
+        leds[0][leds_arr[j][i]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+        }
+      }
+      if(j == 8){
+        leds[0][leds_arr[j][3]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+      }
+      if(j == 5 or j == 2){
+        leds[0][leds_arr[j][4]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+        leds[0][leds_arr[j][0]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+      }
+      if(j == 1){
+        leds[0][leds_arr[j][1]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+        leds[0][leds_arr[j][2]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+        leds[0][leds_arr[j][3]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+      }
+    }  
+
+    for(uint8_t i=0; i<10; i++){
+      if(i == 0 or i == 6){
+        for(uint8_t j=0; j<5; j++){
+          leds[1][leds_arr[i][j]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        }
+      }
+      if(i == 1){
+        leds[1][leds_arr[i][4]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][2]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+      }
+      if(i == 2){
+        leds[1][leds_arr[i][4]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][3]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][2]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+      }
+      if(i == 3 or i == 5){
+        leds[1][leds_arr[i][0]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][1]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][2]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][3]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+      }
+      if(i == 4){
+        leds[1][leds_arr[i][4]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        leds[1][leds_arr[i][2]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+      }
+      if(i ==7 or i == 8){
+        leds[1][leds_arr[i][0]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+      }
+    }
+
+  break;
+  
+  case 1:
+
+  break;
+  default:
+    break;
+  }
+  nblendPaletteTowardPalette(palettes_arr[2],palettes_arr[palette_index],70);
+  FastLED.show();
+}
 void timer1_callback(TimerHandle_t pxTimer){
   timer1_started = true;
   brightness_control(0);
@@ -596,8 +642,9 @@ void touch_func(void* parameters){
     case B100:
       //brightness controls
       touch_reading = touch_reader();
-      vTaskSuspend(rainbow_handle);
+      vTaskSuspend(normal_vis_handle);
       vTaskSuspend(spi_handle);
+      vTaskSuspend(fft_handle);
       suspend_flag =true;
       switch (touch_reading){
         case B100:
@@ -704,31 +751,51 @@ void touch_func(void* parameters){
     break;
 
     case B010:
-      //mode and palette controls
+      // mode and palette controls
+      // disable mode and palette controls when white lights are on
+      if(white_lights){
+        Serial.println("white lights enabled mode and pal controls disabled");
+        modePalette_control_flag = false;
+        first_touch_val = 0;
+        first_touch_flag = true;
+        break;
+      }
       touch_reading = touch_reader();
-      vTaskSuspend(rainbow_handle);
+      vTaskSuspend(normal_vis_handle);
       vTaskSuspend(spi_handle);
+      vTaskSuspend(fft_handle);
       suspend_flag =true;
       switch (touch_reading)
       {
       case B010:
-      // show mode and palette menu
+      //speed up palette hue increment in menu to view palettes better
+        if(hue_timer_change_peiod_flag == false){
+          xTimerChangePeriod(hue_timer, pdTICKS_TO_MS(20), 0);
+          hue_timer_change_peiod_flag = true;
+        }
+        mode_palette_control(0);
       break;
       
       case B110:
-        if(short_press1){
-          short_press1 = false;
-          if(palette_index<2){
+        
+      break;
+
+      case B011:
+        if(short_press3){
+          short_press3 = false;
+          if(palette_index<3){
             palette_index +=1;
           }
           else{
             palette_index = 0;
           }
-        modePalette_control_flag = true;
+          modePalette_control_flag = true;
+          }
+        if(short_press3 == false){
+          mode_palette_control(0);
         }
-      break;
-
-      case B011:
+        Serial.print("palette index: ");
+        Serial.println(palette_index);
       break;
 
       default:
@@ -736,6 +803,12 @@ void touch_func(void* parameters){
         modePalette_control_flag = false;
         first_touch_val = 0;
         first_touch_flag = true;
+        //change the hue increment timer back to original after closing mode and palette menu
+        if(hue_timer_change_peiod_flag == true){
+          xTimerChangePeriod(hue_timer, pdTICKS_TO_MS(80), 0);
+          hue_timer_change_peiod_flag = false;
+        }
+ 
       break;
       }
     break;
@@ -743,8 +816,9 @@ void touch_func(void* parameters){
     case B001:
       //white lights and speaker on off controls
       touch_reading = touch_reader();
-      vTaskSuspend(rainbow_handle);
+      vTaskSuspend(normal_vis_handle);
       vTaskSuspend(spi_handle);
+      vTaskSuspend(fft_handle);
       suspend_flag =true;
       switch (touch_reading){
         case B111:
@@ -798,10 +872,13 @@ void touch_func(void* parameters){
     
     if(suspend_flag and touch_reader() == 0){
       if(white_lights != true){
-        vTaskResume(rainbow_handle);
+        vTaskResume(normal_vis_handle);
         vTaskResume(spi_handle);
+        vTaskResume(fft_handle);
       suspend_flag = false;
       }
+    
+    FastLED.show();
       
     }
     vTaskDelay(10/portTICK_PERIOD_MS);
@@ -815,7 +892,7 @@ void hue_callback(TimerHandle_t pxTimer){
 }
 
 void mapping_decay_callback(TimerHandle_t pxTimer){
-  if (mapping_max >=1300)
+  if (mapping_max >=900)
   {
     mapping_max -= 100;
   }
@@ -836,7 +913,6 @@ void peak_decay_callback(TimerHandle_t pxTimer){
 //0x60 = B11000000
 
 void spi(void* parameters){
-
   uint8_t *p_received_ch0, *p_received_ch1;
   p_received_ch0 = received_ch0;
   p_received_ch1 = received_ch1;
@@ -873,145 +949,157 @@ void spi(void* parameters){
       
       }
   }
-    if (xQueueSend(fft_in_queue, (void *)&fft_buf, 0) !=pdPASS){
-      Serial.println("queue buffer full");
+    if (xQueueSend(fft_in_queue, (void *)&fft_buf, 1/portTICK_PERIOD_MS) !=pdPASS){
+      Serial.println("fft input queue buffer full");
     }
-    // Serial.print("spi free mem: ");
-    // Serial.println(uxTaskGetStackHighWaterMark(spi_handle));
-    // Serial.print("rainbow free mem:");
-    // Serial.println(uxTaskGetStackHighWaterMark(rainbow_handle));
+    else{
+      Serial.println("sent for processing");
+    }
   }
 }
 
-void rainbow(void* parameters){
+void fft(void* paramerters){
   while(1){
-  int oldtime = micros();
-  spi_out fft_buf_received;
+    spi_out fft_buf_received;
+    fft_out processed_buf, old_processed_buf;
 
-  float *p_fft_input_ch0, *p_fft_input_ch1;
-  p_fft_input_ch0 = fft_input_ch0;
-  p_fft_input_ch1 = fft_input_ch1;
+    float *p_fft_input_ch0, *p_fft_input_ch1;
+    p_fft_input_ch0 = fft_input_ch0;
+    p_fft_input_ch1 = fft_input_ch1;
 
-  uint_fast16_t (*p_amplitude)[10], (*p_old_amplitude)[10];
-  p_amplitude = amplitude;
-  p_old_amplitude = old_amplitude;
+    float *p_fft_output_ch0, *p_fft_output_ch1;
+    p_fft_output_ch0 = fft_output_ch0;
+    p_fft_output_ch1 = fft_output_ch1;
 
-  float *p_fft_output_ch0, *p_fft_output_ch1;
-  p_fft_output_ch0 = fft_output_ch0;
-  p_fft_output_ch1 = fft_output_ch1;
+    if(xQueueReceive(fft_in_queue, (void *)&fft_buf_received, 1/portTICK_PERIOD_MS) ==pdPASS){
+      for (uint_fast16_t i = 0; i < FFT_N; i++){
+        p_fft_input_ch0[i] = fft_buf_received.spi_out_ch0[i];
+        p_fft_input_ch1[i] = fft_buf_received.spi_out_ch1[i];
+      } 
+      //fft magic
+      fft_ch0.removeDC();
+      fft_ch0.hammingWindow();
+      fft_ch0.execute();
+      fft_ch0.complexToMagnitude();
 
-  uint8_t (*p_column_height)[10], (*p_peak_column_height)[10];
-  p_column_height = column_height;
-  p_peak_column_height = peak_column_height;
+      fft_ch1.removeDC();
+      fft_ch1.hammingWindow();
+      fft_ch1.execute();
+      fft_ch1.complexToMagnitude();  
 
-  uint8_t (*p_leds_arr)[6];
-  p_leds_arr = leds_arr;
+      //process fft output
+      p_fft_output_ch0[bands[0]]-=60;
+      p_fft_output_ch1[bands[0]]-=60;
 
-  uint16_t *p_mapping_max;
-  p_mapping_max = &mapping_max;
+      for(uint8_t f=0; f<2; f++){
+        for(uint8_t i=0; i<10; i++){
+          if(f==0){
+            processed_buf.post_process[f][i] = (uint_fast16_t) p_fft_output_ch0[bands[i]];
+          }
+          else{
+            processed_buf.post_process[f][i] = (uint_fast16_t) p_fft_output_ch1[bands[i]];
+          }
+        }
+      }
 
-  CRGB (*p_leds)[num_leds];
-  p_leds = leds;
+      for(uint8_t f=0; f<2;f++){
+        for (uint8_t i=0; i< 10; i++) {
 
-  if(xQueueReceive(fft_in_queue,(void *)&fft_buf_received,0) ==pdTRUE){
-    for (uint_fast16_t i = 0; i < FFT_N; i++){
-      p_fft_input_ch0[i] = fft_buf_received.spi_out_ch0[i];
-      p_fft_input_ch1[i] = fft_buf_received.spi_out_ch1[i];
-    }
-  
-
-  //fft magic
-  fft_ch0.removeDC();
-  fft_ch0.hammingWindow();
-  fft_ch0.execute();
-  fft_ch0.complexToMagnitude();
-
-  fft_ch1.removeDC();
-  fft_ch1.hammingWindow();
-  fft_ch1.execute();
-  fft_ch1.complexToMagnitude();  
-
-  //process fft output
-  fft_output_ch0[bands[0]]-=60;
-  fft_output_ch1[bands[0]]-=60;
-
-  for(uint8_t f=0; f<2; f++){
-    for(uint8_t i=0; i<10; i++){
-      if(f==0){
-        p_amplitude[f][i] = (uint_fast16_t) p_fft_output_ch0[bands[i]];
+          //slow down falling of lights
+          if (processed_buf.post_process[f][i] < old_processed_buf.post_process[f][i]){
+            processed_buf.post_process[f][i] = (processed_buf.post_process[f][i] + old_processed_buf.post_process[f][i])/2; 
+          }
+          
+          //filter out noise picked up by fft
+          if (processed_buf.post_process[f][i]>100 and processed_buf.post_process[f][i]<10000){
+            if(i==0){
+              processed_buf.post_process[f][i] *=0.9;
+            }
+            if(i==1){
+              processed_buf.post_process[f][i] *=0.9;
+            }
+            //amplify the last 3 bands after filtering to make it more visible
+            if(i == 7){
+              processed_buf.post_process[f][i] *=1.08;
+            }
+            if(i == 8){
+              processed_buf.post_process[f][i] *=1.08;
+            }
+            if(i == 9){
+              processed_buf.post_process[f][i] *=1.08;
+            }
+          }
+          else{
+            processed_buf.post_process[f][i]=0;
+          }
+          
+          old_processed_buf.post_process[f][i] = processed_buf.post_process[f][i];
+        }
+      }
+      if(xQueueSend(fft_out_queue, (void*)&processed_buf, 0) == pdPASS){
+        Serial.println("fft and post processing done");
       }
       else{
-        p_amplitude[f][i] = (uint_fast16_t) p_fft_output_ch1[bands[i]];
+        Serial.println("processed output buf full");
       }
     }
   }
+}
 
-  for(uint8_t f=0; f<2;f++){
-    for (uint8_t i=0; i< 10; i++) {
-
-      //slow down rising of lights
-      if (p_amplitude[f][i] > p_old_amplitude[f][i]){
-        p_amplitude[f][i] = (p_amplitude[f][i] + p_old_amplitude[f][i]); 
-      }
+void normal_vis(void* parameters){
+  while(1){
+    fft_out  processed_buf_received;
     
-      //filter out noise picked up by fft
-      if (p_amplitude[f][i]>100 and p_amplitude[f][i]<10000){
-        if(i==0){
-          p_amplitude[f][i] *=0.9;
-        }
-        if(i==1){
-          p_amplitude[f][i] *=0.9;
-        }
-        //amplify the last 3 bands after filetering to make it more visible
-        if(i == 7){
-          p_amplitude[f][i] *=1.08;
-        }
-        if(i == 8){
-          p_amplitude[f][i] *=1.08;
-        }
-        if(i == 9){
-          p_amplitude[f][i] *=1.08;
-        }
-      }
-      else{
-        p_amplitude[f][i]=0;
-      }
-      p_old_amplitude[f][i] = p_amplitude[f][i];
-    }
-  }
+    uint8_t (*p_column_height)[10], (*p_peak_column_height)[10];
+    p_column_height = column_height;
+    p_peak_column_height = peak_column_height;
 
-  for(uint8_t f=0; f<2; f++){
-    for (uint8_t i = 0; i < 10; i++){
-      if (p_amplitude[f][i] >= *p_mapping_max)
-      {
-        *p_mapping_max +=35;
-      }
-      
-      p_column_height[f][i] = map(p_amplitude[f][i], 120, *p_mapping_max, 0, 5);
+    uint8_t (*p_leds_arr)[6];
+    p_leds_arr = leds_arr;
 
-      if(p_peak_column_height[f][i] <= p_column_height[f][i]){
-        p_peak_column_height[f][i] = p_column_height[f][i];
+    uint16_t *p_mapping_max;
+    p_mapping_max = &mapping_max;
+
+    CRGB (*p_leds)[num_leds];
+    p_leds = leds;
+
+    // process the fft output received from the queue to display lights
+    if(xQueueReceive(fft_out_queue, (void *)&processed_buf_received, 0) == pdPASS){
+      Serial.println("processed output received");
+      // standard 10 band visualizer output 
+      for(uint8_t f=0; f<2; f++){
+        for (uint8_t i = 0; i < 10; i++){
+          if (processed_buf_received.post_process[f][i] >= *p_mapping_max)
+            {
+              *p_mapping_max +=35;
+            }
+          p_column_height[f][i] = map(processed_buf_received.post_process[f][i], 120, *p_mapping_max, 0, 5);
+
+          if(p_peak_column_height[f][i] <= p_column_height[f][i]){
+            p_peak_column_height[f][i] = p_column_height[f][i];
+          }
+          
+          for(int j=0; j<=p_peak_column_height[f][i]; j++){
+            p_leds[f][p_leds_arr[i][j]]= ColorFromPalette(palettes_arr[palette_index], i*5+ hue, brightness, LINEARBLEND );
+          }
+          
+          for(int k=5; k>p_peak_column_height[f][i]; k--){
+            p_leds[f][p_leds_arr[i][k]]=CHSV(0,0,0);
+          }
+        }
       }
-      
-      for(int j=0; j<=p_peak_column_height[f][i]; j++){
-        p_leds[f][p_leds_arr[i][j]]= ColorFromPalette(palettes_arr[palette_index], i*5+ hue, brightness, LINEARBLEND );
-      }
-      
-      for(int k=5; k>p_peak_column_height[f][i]; k--){
-        p_leds[f][p_leds_arr[i][k]]=CHSV(0,0,0);
-      }
+      FastLED.show();
     }
-  }
-  FastLED.show();
-  }
-  else{
-   // Serial.println("queue empty");
-  }
+    else{
+      Serial.println("waiting for processing");
+      vTaskDelay(5/portTICK_PERIOD_MS);
+    }
   }
 }
 
 void setup(){
   fft_in_queue = xQueueCreate(2, sizeof(spi_out));
+  fft_out_queue = xQueueCreate(2,sizeof(fft_out));
 
   Serial.begin(115200);
   pinMode(relay_pin, OUTPUT); 
@@ -1041,9 +1129,10 @@ void setup(){
     }   
   }
   
-  xTaskCreatePinnedToCore(spi,"spi",5200,NULL,1,&spi_handle,1);
-  xTaskCreatePinnedToCore(rainbow,"rainbow",5200,NULL,1,&rainbow_handle,0);
-  xTaskCreate(touch_func,"touch_func", 3000, NULL, 1, &ISR_handler_handle);
+  xTaskCreatePinnedToCore(spi,"spi",6000,NULL,1,&spi_handle,1);
+  xTaskCreate(fft, "fft", 6200, NULL, 1, &fft_handle);
+  xTaskCreate(normal_vis,"normal_vis",2000,NULL,1,&normal_vis_handle);
+  xTaskCreate(touch_func,"touch_func", 1500, NULL, 1, &ISR_handler_handle);
 
   // create timers to manage time routine tasks
   touch1_timer = xTimerCreate("touch1_timer", pdMS_TO_TICKS(3000), pdFALSE, (void*)1, timer1_callback);
@@ -1056,6 +1145,8 @@ void setup(){
   xTimerStart(hue_timer, 0);
   xTimerStart(mapping_decay_timer, 0);
   xTimerStart(peak_decay_timer, 0);
+
+  vTaskDelete(NULL);
 }
 
 void loop(){
