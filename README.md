@@ -8,5 +8,6 @@ The upgrades in this project compared to the previous one:
 - Built in 20W stereo speakers 
 - High clarity audio driven by class AB amplifier with ground loop isolator
 - Digital touch controls
+- Runs tasks using both cores of the ESP32 for higher frame rates
 
 # Work in progress do not use this repo yet
