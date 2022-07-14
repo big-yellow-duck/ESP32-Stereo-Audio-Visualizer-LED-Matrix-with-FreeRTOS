@@ -8,3 +8,5 @@ The upgrades in this project compared to the previous one:
 - Built in 20W stereo speakers 
 - High clarity audio driven by class AB amplifier with ground loop isolator
 - Digital touch controls
+
+#Work in progress
