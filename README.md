@@ -9,4 +9,4 @@ The upgrades in this project compared to the previous one:
 - High clarity audio driven by class AB amplifier with ground loop isolator
 - Digital touch controls
 
-#Work in progress
+# Work in progress do not use this repo yet
