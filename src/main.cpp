@@ -22,7 +22,7 @@ static const uint8_t max_brightness=190;
 static const uint8_t min_brightness=2;
 
 static TaskHandle_t normal_vis_handle, ISR_handler_handle, spi_handle, fill_white_lights_handle, fft_handle, wave_vis_handle, mode_animation_handle;
-static TimerHandle_t touch1_timer, touch2_timer, touch3_timer, hue_timer, mapping_decay_timer, peak_decay_timer, wave_frame_timer, mode_animation_timer, mode_animation_frame_timer;
+static TimerHandle_t touch1_timer, touch2_timer, touch3_timer, hue_timer, mapping_decay_timer, peak_decay_timer, wave_frame_timer, mode_animation_timer, mode_animation_random_timer;
 
 float fft_input_ch0[FFT_N]; //input array for fft calculations
 float fft_input_ch1[FFT_N];
@@ -84,9 +84,13 @@ bool long_press3 = true;
 
 bool brightness_control_flag = false;
 bool mode_control_flag = false;
+bool mode_animation_started = false;
 
 static volatile bool shift_frame = false;
 static bool wave_frame_timer_flag = false;
+static bool wave_frame_timer_period_change_flag = false;
+static bool mode_animation_random_timer_flag = false;
+static bool mode_animation_random_on = true;
 
 static bool hue_timer_change_peiod_flag = false;
 
@@ -495,24 +499,71 @@ void brightness_control(uint8_t choice){
 }
 
 void mode_animation(void* parameters){
+  uint8_t mode1_column_heights[10] = {1,2,3,4,5,5,4,3,2,1};
+  uint8_t mode1_column_index = 0;
   while (1){
     switch (current_mode){
     case 1:
-      for(uint8_t i=0; i<10; i++){
-        column_height[1][i] = beatsin8(15, 2, 4, 0, 0);
-        for(uint8_t j=0; j<column_height[1][i]; j++){
-        leds[1][leds_arr[1][j]] = ColorFromPalette(palettes_arr[2], j*9 + hue, brightness, LINEARBLEND);
+      //Serial.println("running mode animation 1");
+      if(wave_frame_timer_flag == false){
+        xTimerStart(wave_frame_timer,0);
+        wave_frame_timer_flag =true;
+      }
+      if(shift_frame){
+        shift_frame = false;
+        xTimerStart(wave_frame_timer,0);
+        column_height[1][0] = mode1_column_heights[mode1_column_index];
+        for(uint8_t i=0; i<column_height[1][0]; i++){
+          leds[1][leds_arr[0][i]] = ColorFromPalette(palettes_arr[2],hue, brightness, LINEARBLEND);
+        }
+        for(uint8_t i=5; i>column_height[1][0]; i--){
+          leds[1][leds_arr[0][i]] = CRGB(0,0,0);
+        }
+        for(uint8_t i=9; i>0; i-- ){
+          column_height[1][i] = column_height[1][i-1];
+        }
+        for(uint8_t i=1; i<10; i++){
+          for(uint8_t j=0; j<column_height[1][i]; j++){
+            leds[1][leds_arr[i][j]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+          }
+          for(uint8_t k=5; k>column_height[1][i]; k--){
+            leds[1][leds_arr[i][k]] = CRGB(0,0,0);
+          }
+        }
+        mode1_column_index +=1;
+        if(mode1_column_index >9){
+          mode1_column_index = 0;
         }
       }
     break;
     
     case 0:
-
+      // periodically generate random peak column heights based on the mode_animation_random_timer
+      if(mode_animation_random_on){
+        for(uint8_t i=0; i<10; i++){
+          peak_column_height[1][i] = random8(2,6);
+        }
+        mode_animation_random_on = false;
+      }
+      if(mode_animation_random_timer_flag == false){
+        xTimerStart(mode_animation_random_timer,0);
+        mode_animation_random_timer_flag = true;
+      }
+      for(uint8_t i=0; i<10; i++){
+        for(uint8_t j=0; j<peak_column_height[1][i]; j++){
+          leds[1][leds_arr[i][j]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+        }
+        for(uint8_t k=5; k>peak_column_height[1][i]; k--){
+          leds[1][leds_arr[i][k]] = CRGB(0,0,0);
+        }
+      }
+      
     break;
     default:
       break;
     }
     vTaskDelay(10/portTICK_PERIOD_MS);
+    nblendPaletteTowardPalette(palettes_arr[2],palettes_arr[palette_index],70);
     FastLED.show();
   }
   
@@ -678,9 +729,10 @@ void touch_func(void* parameters){
   bool suspend_flag = false;
   bool white_lights = false;
   bool speaker_on = true;
-  bool mode_animation_started = false;
+  
   while(1){
     if(first_touch_flag ==true and touch_reader()>0){
+      vTaskPrioritySet(NULL, 2);
       first_touch_val = touch_reader();
       first_touch_flag = false;
       Serial.print("first touch val: ");
@@ -730,8 +782,8 @@ void touch_func(void* parameters){
             timer2_started = false;
           }
           if(millis()-touch3_time<1000){
-            Serial.print("touch3 time: ");
-            Serial.println((millis()-touch3_time));
+            // Serial.print("touch3 time: ");
+            // Serial.println((millis()-touch3_time));
             if(short_press3){
               brightness_control(1);
               short_press3 = false;
@@ -758,8 +810,8 @@ void touch_func(void* parameters){
             timer3_started =false;
           }
           if(millis()-touch2_time<1000){
-            Serial.print("touch2 time: ");
-            Serial.println((millis()-touch2_time));
+            //Serial.print("touch2 time: ");
+            //Serial.println((millis()-touch2_time));
             if(short_press2){
               brightness_control(2);
               short_press2 = false;
@@ -822,10 +874,22 @@ void touch_func(void* parameters){
       case B010:
       //speed up palette hue increment in menu to view palettes better
         if(hue_timer_change_peiod_flag == false){
-          xTimerChangePeriod(hue_timer, pdTICKS_TO_MS(20), 0);
+          xTimerChangePeriod(hue_timer, pdMS_TO_TICKS(20), 0);
           hue_timer_change_peiod_flag = true;
         }
-        mode_palette_control(0);
+        if(wave_frame_timer_period_change_flag == false){
+          xTimerChangePeriod(wave_frame_timer, pdMS_TO_TICKS(80),0);
+          wave_frame_timer_period_change_flag = true;
+          Serial.println("wave timer 80");
+        }
+        // only update the left led array when the mode animation is running
+        if(mode_animation_started){
+          mode_palette_control(1);
+        }
+        else{
+          //show mode palette controls when no animation is running
+          mode_palette_control(0);
+        }
       break;
       
       case B110:
@@ -841,10 +905,17 @@ void touch_func(void* parameters){
           Serial.println(current_mode);
           if (mode_animation_started == false){
             vTaskResume(mode_animation_handle);
+            xTimerStart(mode_animation_timer, 0);
             mode_animation_started = true;
             Serial.println("mode animation started");
           }
-          
+          //reset the mode animation timer every time a mode is changed
+          xTimerReset(mode_animation_timer,0);
+        }
+        //show mode palette controls when animation times out
+        if(mode_animation_started == false){
+          mode_palette_control(0);
+          Serial.println("showing mode palette controls from mode change");
         }
         mode_palette_control(1);
       break;
@@ -862,7 +933,12 @@ void touch_func(void* parameters){
           Serial.println(palette_index);
         }
         if(short_press3 == false){
+          if(mode_animation_started == true){
+            mode_palette_control(1);
+          }
+          else{
           mode_palette_control(0);
+          }
         }
         
       break;
@@ -875,12 +951,18 @@ void touch_func(void* parameters){
         if(mode_animation_started){
           vTaskSuspend(mode_animation_handle);
           mode_animation_started = false;
+          xTimerStop(mode_animation_timer,0);
           Serial.println("mode animation stopped");
         }
         //change the hue increment timer back to original after closing mode and palette menu
         if(hue_timer_change_peiod_flag == true){
           xTimerChangePeriod(hue_timer, pdTICKS_TO_MS(80), 0);
           hue_timer_change_peiod_flag = false;
+        }
+        if(wave_frame_timer_period_change_flag == true){
+          xTimerChangePeriod(wave_frame_timer, pdMS_TO_TICKS(65),0);
+          wave_frame_timer_period_change_flag = false;
+          Serial.println("wave timer 65");
         }
  
       break;
@@ -942,7 +1024,8 @@ void touch_func(void* parameters){
     default:
       first_touch_val = 0;
       first_touch_flag = true;
-      break;
+      vTaskPrioritySet(NULL, 1);
+    break;
     }
     
     if(suspend_flag and touch_reader() == 0){
@@ -950,6 +1033,7 @@ void touch_func(void* parameters){
         vTaskResume(spi_handle);
         vTaskResume(fft_handle);
         if(current_mode == 0){
+          Serial.println("mode 0");
           vTaskResume(normal_vis_handle);
           vTaskSuspend(wave_vis_handle);
           if(wave_frame_timer_flag){
@@ -958,6 +1042,7 @@ void touch_func(void* parameters){
           }
         }
         if(current_mode == 1){
+          Serial.println("mode 1");
           vTaskResume(wave_vis_handle);
           vTaskSuspend(normal_vis_handle);
           clear_leds(0);
@@ -974,22 +1059,26 @@ void touch_func(void* parameters){
     //FastLED.show();
       
     }
-    vTaskDelay(10/portTICK_PERIOD_MS);
+    vTaskDelay(5/portTICK_PERIOD_MS);
   }
 }
 void wave_frame_callback(TimerHandle_t pxTimer){
   shift_frame = true;
-  Serial.println("wave timer tick");
+  //Serial.println("wave timer tick");
 }
 
 void mode_animation_callback(TimerHandle_t pxTimer){
- 
+ vTaskSuspend(mode_animation_handle);
+ mode_animation_started = false;
+ Serial.println("mode animation timeout");
 }
 
-void mode_animation_frame_callback(TimerHandle_t pxTimer){
-  frame_count +=1;
-  FastLED.show();
+void mode_animation_random_callback(TimerHandle_t pxTimer){
+  mode_animation_random_on = true;
+  mode_animation_random_timer_flag = false;
+  Serial.println("animation random tick");
 }
+
 void hue_callback(TimerHandle_t pxTimer){
   //increment the hue every 65 milliseconds
   hue+=2;
@@ -1196,7 +1285,7 @@ void normal_vis(void* parameters){
           }
           
           for(int j=0; j<=p_peak_column_height[f][i]; j++){
-            p_leds[f][p_leds_arr[i][j]]= ColorFromPalette(palettes_arr[palette_index], i*5+ hue, brightness, LINEARBLEND );
+            p_leds[f][p_leds_arr[i][j]]= ColorFromPalette(palettes_arr[palette_index], i*5+ hue, brightness, LINEARBLEND);
           }
           
           for(int k=5; k>p_peak_column_height[f][i]; k--){
@@ -1241,6 +1330,7 @@ void wave_vis(void* parameters){
           }
           column_height[f][i] = map(processed_buf_received.post_process[f][i], 120, *p_mapping_max, 0, 5);
           //get highest column to display 
+          // reuse array to use peak decay timer
           if(p_peak_column_height[f][0] <= column_height[f][i]){
             p_peak_column_height[f][0] = column_height[f][i];
           }
@@ -1333,7 +1423,7 @@ void setup(){
   peak_decay_timer = xTimerCreate("peak_decay_timer", pdMS_TO_TICKS(70), pdTRUE, (void*)6, peak_decay_callback);
   wave_frame_timer = xTimerCreate("wave_frame_timer", pdMS_TO_TICKS(65), pdFALSE, (void*)7, wave_frame_callback);
   mode_animation_timer = xTimerCreate("mode_animation_timer", pdTICKS_TO_MS(3000), pdFALSE, (void*)8, mode_animation_callback);
-  mode_animation_frame_timer = xTimerCreate("mode_animation_timer", pdTICKS_TO_MS(80), pdTRUE,(void*)9,mode_animation_frame_callback);
+  mode_animation_random_timer = xTimerCreate("mode_animation_random_timer", pdTICKS_TO_MS(250), pdFALSE,(void*)9,mode_animation_random_callback);
 
 
   xTimerStart(hue_timer, 0);
