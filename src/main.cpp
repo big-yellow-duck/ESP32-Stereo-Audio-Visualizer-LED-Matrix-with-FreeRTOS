@@ -2,6 +2,7 @@
 #include <FastLED.h>
 #include <SPI.h>
 #include "ESP32_fft.h"
+#include <EEPROM.h>
 
 #define VSPI_MISO 19
 #define VSPI_MOSI 23
@@ -12,11 +13,10 @@
 #define SAMPLEFREQ 40000 //time taken to obtain 512 samples at 40,000Hz
 #define noise_filter 
 
+//touch pins to use with the ESP32
 #define touch1 32
 #define touch2 33
 #define touch3 27
-
-#define mapping_max_val 2000;
 
 static const uint8_t max_brightness=190;
 static const uint8_t min_brightness=2;
@@ -29,31 +29,36 @@ float fft_input_ch1[FFT_N];
 float fft_output_ch0[FFT_N];// fft output array
 float fft_output_ch1[FFT_N];
 
+//struct to hold data to send to the spi output queue
 typedef struct spi_out{
   float spi_out_ch0[FFT_N];
   float spi_out_ch1[FFT_N];
 }spi_out;
 
-
+//struct to hold data to send to another task that will use the fft output
 typedef struct fft_out{
   uint_fast16_t post_process[2][10];
 }fft_out;
 
+// create fft classes
 ESP_fft fft_ch0(FFT_N, SAMPLEFREQ, FFT_REAL, FFT_FORWARD, fft_input_ch0, fft_output_ch0);
 ESP_fft fft_ch1(FFT_N, SAMPLEFREQ, FFT_REAL, FFT_FORWARD, fft_input_ch1, fft_output_ch1);
 
+// choose the specific frequencies to analyze
 uint16_t bands[10] = {1,3,6,13,20,26,32,40,52,64}; //78.125, 234.375, 468.75, 1015.625, 1562.5, 2031.25, 2500, 3125, 4062.5, 5000 (Frequencies to analyse)
 
+//maximum map map value for the fft output
 uint16_t mapping_max =2000;
 
 static const int spiClk =8000000; //8 MHZ SPI CLock
 
 SPIClass *vspi = NULL;
 
+// create arrays to hold the received spi data
 static uint8_t received_ch0[2];
 static uint8_t received_ch1[2];
 
-//create queue to hold fft input buffer
+//create queue to hold fft input and output for intertask communication
 QueueHandle_t fft_in_queue, fft_out_queue;
 
 //define the pins that will be used to interface the components of the project
@@ -62,29 +67,26 @@ const uint8_t left_leds=17;
 const uint8_t num_leds=60;
 const uint8_t relay_pin=12;
 
-static uint8_t frame_count = 0;
+// create global flags that will be used to control functions
+static bool touch1_active = false;
+static bool touch2_active = false;
+static bool touch3_active = false;
+static bool touch1_letgo = true;
+static bool touch2_letgo = true;
+static bool touch3_letgo = true;
+static bool short_press1 = true;
+static bool short_press2 = true;
+static bool short_press3 = true;
+static bool timer1_started = false;
+static bool timer2_started = false;
+static bool timer3_started = false;
+static bool long_press1 = true;
+static bool long_press2 = true;
+static bool long_press3 = true;
 
-//const uint16_t touch_threshold = 40;
-
-bool touch1_active = false;
-bool touch2_active = false;
-bool touch3_active = false;
-bool touch1_letgo = true;
-bool touch2_letgo = true;
-bool touch3_letgo = true;
-bool short_press1 = true;
-bool short_press2 = true;
-bool short_press3 = true;
-bool timer1_started = false;
-bool timer2_started = false;
-bool timer3_started = false;
-bool long_press1 = true;
-bool long_press2 = true;
-bool long_press3 = true;
-
-bool brightness_control_flag = false;
-bool mode_control_flag = false;
-bool mode_animation_started = false;
+static bool brightness_control_flag = false;
+static bool mode_control_flag = false;
+static bool mode_animation_started = false;
 
 static volatile bool shift_frame = false;
 static bool wave_frame_timer_flag = false;
@@ -94,17 +96,23 @@ static bool mode_animation_random_on = true;
 
 static bool hue_timer_change_peiod_flag = false;
 
+// variables to hold the duration of pin that was touched
 static int touch1_time, touch2_time, touch3_time;
 
 uint8_t hue = 0;
 uint8_t brightness = 60;
-uint8_t column_height[2][10], peak_column_height[2][10], single_column_height[2] ={0,0};
-uint8_t palette_index = 2;
+uint8_t column_height[2][10], peak_column_height[2][10];
+uint8_t palette_index = 0;
 uint8_t current_mode = 0;
 
 //create the structure that will be be used to address the leds
 static CRGB leds[2][num_leds];
 
+/* To modify the color palettes to use your own palettes,
+  Modifiy the palette index increment in the "touch_func" task 
+  to add or decrease the palettes. Modify the palettes declaration section
+  to customize your palettes.
+*/
 DEFINE_GRADIENT_PALETTE(heat_colors){
   0,  0,0,255,
   127,255,0,0,
@@ -114,7 +122,7 @@ DEFINE_GRADIENT_PALETTE(heat_colors){
 CRGBPalette16 palettes_arr[] ={
   //standard rainbow palette
   RainbowColors_p,
-  //bb palette 1
+  //custom palette 0
   CRGBPalette16(CRGB(255, 0, 84),
                 CRGB(255, 0, 84),
                 CRGB(60, 60, 255),
@@ -134,7 +142,7 @@ CRGBPalette16 palettes_arr[] ={
                 CRGB(60, 60, 255),
                 CRGB(255, 0, 84),
                 CRGB(255, 0, 84)),
-  //bb palette 2
+  //custom palette 1
   CRGBPalette16(CRGB(255, 0, 0),
                 CRGB(255, 0, 0),
                 CRGB(255, 100, 100),
@@ -154,7 +162,7 @@ CRGBPalette16 palettes_arr[] ={
                 CRGB(255, 100, 100),
                 CRGB(255, 0, 0),
                 CRGB(255, 0, 0)),
-
+  //heat colors palette
   heat_colors            
 };
 
@@ -165,7 +173,7 @@ CRGBPalette16 palettes_arr[] ={
 */
 static uint8_t leds_arr[10][6];
 
-
+//functions used to display numbers 
 void zero(uint8_t lr, uint8_t pos){
   for(uint8_t i=0; i<5; i++){
     leds[lr][leds_arr[0+pos][i]] = CHSV(0,0,brightness);
@@ -932,6 +940,7 @@ void touch_func(void* parameters){
           Serial.print("palette index: ");
           Serial.println(palette_index);
         }
+        //if animation is running, only update the left led array
         if(short_press3 == false){
           if(mode_animation_started == true){
             mode_palette_control(1);
