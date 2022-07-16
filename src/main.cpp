@@ -4,6 +4,8 @@
 #include "ESP32_fft.h"
 #include <EEPROM.h>
 
+#define EEPROM_size 3
+
 #define VSPI_MISO 19
 #define VSPI_MOSI 23
 #define VSPI_SCLK 18
@@ -21,7 +23,7 @@
 static const uint8_t max_brightness=190;
 static const uint8_t min_brightness=2;
 
-static TaskHandle_t normal_vis_handle, ISR_handler_handle, spi_handle, fill_white_lights_handle, fft_handle, wave_vis_handle, mode_animation_handle;
+static TaskHandle_t normal_vis_handle, ISR_handler_handle, spi_handle, fill_white_lights_handle, fft_handle, wave_vis_handle;
 static TimerHandle_t touch1_timer, touch2_timer, touch3_timer, hue_timer, mapping_decay_timer, peak_decay_timer, wave_frame_timer, mode_animation_timer, mode_animation_random_timer;
 
 float fft_input_ch0[FFT_N]; //input array for fft calculations
@@ -85,7 +87,6 @@ static bool long_press2 = true;
 static bool long_press3 = true;
 
 static bool brightness_control_flag = false;
-static bool mode_control_flag = false;
 static bool mode_animation_started = false;
 
 static volatile bool shift_frame = false;
@@ -93,17 +94,20 @@ static bool wave_frame_timer_flag = false;
 static bool wave_frame_timer_period_change_flag = false;
 static bool mode_animation_random_timer_flag = false;
 static bool mode_animation_random_on = true;
+static bool initial_clear = false;
 
 static bool hue_timer_change_peiod_flag = false;
 
 // variables to hold the duration of pin that was touched
 static int touch1_time, touch2_time, touch3_time;
 
-uint8_t hue = 0;
-uint8_t brightness = 60;
-uint8_t column_height[2][10], peak_column_height[2][10];
-uint8_t palette_index = 0;
-uint8_t current_mode = 0;
+static uint8_t hue = 0;
+static uint8_t brightness = 60;
+static uint8_t column_height[2][10], peak_column_height[2][10];
+static uint8_t palette_index = 0;
+static uint8_t current_mode = 0;
+
+static uint8_t mode1_column_index = 0;
 
 //create the structure that will be be used to address the leds
 static CRGB leds[2][num_leds];
@@ -119,7 +123,7 @@ DEFINE_GRADIENT_PALETTE(heat_colors){
   255,255,255,40
 };
 
-CRGBPalette16 palettes_arr[] ={
+static CRGBPalette16 palettes_arr[] ={
   //standard rainbow palette
   RainbowColors_p,
   //custom palette 0
@@ -406,7 +410,7 @@ void number_display(bool left_pos){
   else{
     clear_leds(1);
     number_str = (String) brightness;
-    for(uint8_t i=0; i<number_str.length(); i++){
+    for(uint8_t i=0; i<=number_str.length(); i++){
       switch (number_str[i])
       {
         case '0':
@@ -488,6 +492,8 @@ void brightness_control(uint8_t choice){
         }
       }
       number_display(true);
+      EEPROM.write(0, brightness);
+      EEPROM.commit();
       break;
     // decrease brightness by 2 and show brighness value on the right.
     case 2:
@@ -502,88 +508,83 @@ void brightness_control(uint8_t choice){
         }
       }
       number_display(false);
+      EEPROM.write(0, brightness);
+      EEPROM.commit();
       break;
   }
 }
 
-void mode_animation(void* parameters){
+void mode_animation(uint8_t animation_choice){
   uint8_t mode1_column_heights[10] = {1,2,3,4,5,5,4,3,2,1};
-  uint8_t mode1_column_index = 0;
-  while (1){
-    switch (current_mode){
-    case 1:
-      //Serial.println("running mode animation 1");
-      if(wave_frame_timer_flag == false){
-        xTimerStart(wave_frame_timer,0);
-        wave_frame_timer_flag =true;
+  switch (animation_choice){
+  case 1:
+    //start wave frame timer for mode 1 animation
+    if(wave_frame_timer_flag == false){
+      xTimerStart(wave_frame_timer,0);
+      wave_frame_timer_flag =true;
+      Serial.println("wave frame timer started");
+    }
+    if(shift_frame){
+      shift_frame = false;
+      column_height[1][0] = mode1_column_heights[mode1_column_index];
+      for(uint8_t i=0; i<column_height[1][0]; i++){
+        leds[1][leds_arr[0][i]] = ColorFromPalette(palettes_arr[2],hue, brightness, LINEARBLEND);
       }
-      if(shift_frame){
-        shift_frame = false;
-        xTimerStart(wave_frame_timer,0);
-        column_height[1][0] = mode1_column_heights[mode1_column_index];
-        for(uint8_t i=0; i<column_height[1][0]; i++){
-          leds[1][leds_arr[0][i]] = ColorFromPalette(palettes_arr[2],hue, brightness, LINEARBLEND);
-        }
-        for(uint8_t i=5; i>column_height[1][0]; i--){
-          leds[1][leds_arr[0][i]] = CRGB(0,0,0);
-        }
-        for(uint8_t i=9; i>0; i-- ){
-          column_height[1][i] = column_height[1][i-1];
-        }
-        for(uint8_t i=1; i<10; i++){
-          for(uint8_t j=0; j<column_height[1][i]; j++){
-            leds[1][leds_arr[i][j]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
-          }
-          for(uint8_t k=5; k>column_height[1][i]; k--){
-            leds[1][leds_arr[i][k]] = CRGB(0,0,0);
-          }
-        }
-        mode1_column_index +=1;
-        if(mode1_column_index >9){
-          mode1_column_index = 0;
-        }
+      for(uint8_t i=5; i>column_height[1][0]; i--){
+        leds[1][leds_arr[0][i]] = CRGB(0,0,0);
       }
-    break;
-    
-    case 0:
-      // periodically generate random peak column heights based on the mode_animation_random_timer
-      if(mode_animation_random_on){
-        for(uint8_t i=0; i<10; i++){
-          peak_column_height[1][i] = random8(2,6);
-        }
-        mode_animation_random_on = false;
+      for(uint8_t i=9; i>0; i-- ){
+        column_height[1][i] = column_height[1][i-1];
       }
-      if(mode_animation_random_timer_flag == false){
-        xTimerStart(mode_animation_random_timer,0);
-        mode_animation_random_timer_flag = true;
-      }
-      for(uint8_t i=0; i<10; i++){
-        for(uint8_t j=0; j<peak_column_height[1][i]; j++){
+      for(uint8_t i=1; i<10; i++){
+        for(uint8_t j=0; j<column_height[1][i]; j++){
           leds[1][leds_arr[i][j]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
         }
-        for(uint8_t k=5; k>peak_column_height[1][i]; k--){
+        for(uint8_t k=5; k>column_height[1][i]; k--){
           leds[1][leds_arr[i][k]] = CRGB(0,0,0);
         }
       }
-      
-    break;
-    default:
-      break;
+      mode1_column_index +=1;
+      if(mode1_column_index >9){
+        mode1_column_index = 0;
+      }
     }
-    vTaskDelay(10/portTICK_PERIOD_MS);
-    nblendPaletteTowardPalette(palettes_arr[2],palettes_arr[palette_index],70);
-    FastLED.show();
+  break;
+  
+  case 0:
+    // periodically generate random peak column heights based on the mode_animation_random_timer
+    if(mode_animation_random_on){
+      for(uint8_t i=0; i<10; i++){
+        peak_column_height[1][i] = random8(2,6);
+      }
+      mode_animation_random_on = false;
+    }
+    if(mode_animation_random_timer_flag == false){
+      xTimerStart(mode_animation_random_timer,0);
+      mode_animation_random_timer_flag = true;
+    }
+    for(uint8_t i=0; i<10; i++){
+      for(uint8_t j=0; j<peak_column_height[1][i]; j++){
+        leds[1][leds_arr[i][j]] = ColorFromPalette(palettes_arr[2], i*9 + hue, brightness, LINEARBLEND);
+      }
+      for(uint8_t k=5; k>peak_column_height[1][i]; k--){
+        leds[1][leds_arr[i][k]] = CRGB(0,0,0);
+      }
+    }
+    
+  break;
+  default:
+    break;
   }
-  
-  
+  vTaskDelay(10/portTICK_PERIOD_MS);
+  nblendPaletteTowardPalette(palettes_arr[2],palettes_arr[palette_index],70);
+  FastLED.show();
 }
 void mode_palette_control(uint8_t choice){
-  
   switch (choice)
   {
   case 0:
-    clear_leds(0);
-    clear_leds(1);
+   
     for(uint8_t j=0; j<10; j++){
       if(j == 9 or j == 7 or j == 6 or j == 4 or j== 3){
       for(uint8_t i=0; i<5; i++){
@@ -734,37 +735,43 @@ void touch_func(void* parameters){
   uint8_t touch_reading;
   uint8_t first_touch_val;
   bool first_touch_flag = true;
-  bool suspend_flag = false;
+  bool suspend_flag = true;
   bool white_lights = false;
   bool speaker_on = true;
-  
+
   while(1){
     if(first_touch_flag ==true and touch_reader()>0){
+      // raise priority of first touch func when touch is detected
       vTaskPrioritySet(NULL, 2);
+      Serial.println("touch func priority raised");
       first_touch_val = touch_reader();
       first_touch_flag = false;
       Serial.print("first touch val: ");
       Serial.println(first_touch_val,BIN);
-     }
-    switch (first_touch_val)
-    {
-    case B100:
-      //brightness controls
-      touch_reading = touch_reader();
+
+      // suspend all passive tasks when touch is detected
       vTaskSuspend(normal_vis_handle);
       vTaskSuspend(wave_vis_handle);
       vTaskSuspend(spi_handle);
       vTaskSuspend(fft_handle);
       suspend_flag =true;
+      Serial.println("all passive tasks suspended");
+    }
+    // choose which menu to enter based on which button was touched first
+    switch (first_touch_val){
+    case B100:
+      //brightness controls
+      touch_reading = touch_reader();
       switch (touch_reading){
         case B100:
-          // if brightness was changed before coming here, wait 500ms before showing default -+ menu
+          //if brightness was changed before coming here, wait 3 seconds before showing default -+ menu
           if (brightness_control_flag == true){
             if(timer1_started == false){
               xTimerStart(touch1_timer,0);
               timer1_started = true;
               Serial.println("timer1 started");
             }
+            // stop timer 2 and timer 3 to stop brightness value from incrementing periodically
             if(timer2_started){
               xTimerStop(touch2_timer,0);
               timer2_started = false;
@@ -780,6 +787,7 @@ void touch_func(void* parameters){
         break;
           
         case B101:
+        // + brightness
           if (timer1_started){
             xTimerStop(touch1_timer,0);
             timer1_started = false;
@@ -789,43 +797,38 @@ void touch_func(void* parameters){
             xTimerStop(touch2_timer,0);
             timer2_started = false;
           }
-          if(millis()-touch3_time<1000){
-            // Serial.print("touch3 time: ");
-            // Serial.println((millis()-touch3_time));
-            if(short_press3){
-              brightness_control(1);
-              short_press3 = false;
-              Serial.println("short press 3");
-            }
+          if(short_press3){
+            brightness_control(1);
+            short_press3 = false;
+            Serial.println("short press 3");
           }
+          // increntment brightness every 200ms after touch3 has been touched over 1 second
           if(millis()-touch3_time>=1000){
             if(timer3_started == false){
               timer3_started = true;
               xTimerStart(touch3_timer, 0);
-              Serial.println(brightness);
             }
           }
           brightness_control_flag = true;
         break;
 
         case B110:
+        // - brightness
           if(timer1_started){
             xTimerStop(touch1_timer,0);
             timer1_started = false;
+            Serial.println("timer 1 stopped");
           }
           if(timer3_started){
             xTimerStop(touch3_timer,0);
             timer3_started =false;
           }
-          if(millis()-touch2_time<1000){
-            //Serial.print("touch2 time: ");
-            //Serial.println((millis()-touch2_time));
-            if(short_press2){
-              brightness_control(2);
-              short_press2 = false;
-              Serial.println("short press 2");
-            }
+          if(short_press2){
+            brightness_control(2);
+            short_press2 = false;
+            Serial.println("short press 2");
           }
+          // decrease brightness every 200ms after touch3 has been touched over 1 second
           if(millis()-touch2_time>=1000){
             if(timer2_started == false){
               timer2_started = true;
@@ -838,6 +841,7 @@ void touch_func(void* parameters){
 
         default:
           Serial.println("exit first_touch B100 menu");
+          // stop all timers used in brightness controls before exiting
           if(timer1_started){
             xTimerStop(touch1_timer,0);
             timer1_started = false;
@@ -850,10 +854,12 @@ void touch_func(void* parameters){
             xTimerStop(touch3_timer,0);
             timer3_started = false;
           }
+          // if white lights are on, continue displaying white lights after exiting brightness controls
           if(white_lights){
             fill_white_lights();
           }
           brightness_control_flag = false;
+          //allow the first touch value to be changed to enter other menus
           first_touch_val = 0;
           first_touch_flag = true;
         break;
@@ -863,39 +869,33 @@ void touch_func(void* parameters){
     case B010:
       //mode and palette controls
       touch_reading = touch_reader();
-      vTaskSuspend(normal_vis_handle);
-      vTaskSuspend(wave_vis_handle);
-      vTaskSuspend(spi_handle);
-      vTaskSuspend(fft_handle);
-      suspend_flag = true;
       // disable mode and palette controls when white lights are on
       if(white_lights){
         Serial.println("white lights enabled mode and pal controls disabled");
-        mode_control_flag = false;
         first_touch_val = 0;
         first_touch_flag = true;
         break;
       }
-      
+      // speed up palette hue increment in menu to view palettes better
+      if(hue_timer_change_peiod_flag == false){
+        xTimerChangePeriod(hue_timer, pdMS_TO_TICKS(20), 0);
+        hue_timer_change_peiod_flag = true;
+      }
       switch (touch_reading)
       {
       case B010:
-      //speed up palette hue increment in menu to view palettes better
-        if(hue_timer_change_peiod_flag == false){
-          xTimerChangePeriod(hue_timer, pdMS_TO_TICKS(20), 0);
-          hue_timer_change_peiod_flag = true;
-        }
-        if(wave_frame_timer_period_change_flag == false){
-          xTimerChangePeriod(wave_frame_timer, pdMS_TO_TICKS(80),0);
-          wave_frame_timer_period_change_flag = true;
-          Serial.println("wave timer 80");
-        }
         // only update the left led array when the mode animation is running
         if(mode_animation_started){
           mode_palette_control(1);
+          mode_animation(current_mode);
         }
         else{
           //show mode palette controls when no animation is running
+           if(initial_clear == false){
+            clear_leds(0);
+            clear_leds(1);
+            initial_clear = true;
+          }
           mode_palette_control(0);
         }
       break;
@@ -904,15 +904,18 @@ void touch_func(void* parameters){
         //mode change 
         if(short_press1){
           short_press1 = false;
-          mode_control_flag = true;
           current_mode += 1;
           if(current_mode >= 2){
             current_mode = 0;
           }
+
+          EEPROM.write(1, current_mode);
+          EEPROM.commit();
+
           Serial.print("current mode: ");
           Serial.println(current_mode);
+          // start mode animation if not started yet
           if (mode_animation_started == false){
-            vTaskResume(mode_animation_handle);
             xTimerStart(mode_animation_timer, 0);
             mode_animation_started = true;
             Serial.println("mode animation started");
@@ -920,12 +923,23 @@ void touch_func(void* parameters){
           //reset the mode animation timer every time a mode is changed
           xTimerReset(mode_animation_timer,0);
         }
+        /*run the mode_animation function while mode animation function is true
+          mode_animation_started will become false once it times out */
+        if(mode_animation_started){
+          mode_animation(current_mode);
+          // constantly update the left led array while animating modes for a smooth effect
+          mode_palette_control(1);
+        }
         //show mode palette controls when animation times out
         if(mode_animation_started == false){
+          if(initial_clear == false){
+            clear_leds(1);
+            initial_clear = true;
+          }
           mode_palette_control(0);
           Serial.println("showing mode palette controls from mode change");
         }
-        mode_palette_control(1);
+        
       break;
 
       case B011:
@@ -937,28 +951,28 @@ void touch_func(void* parameters){
           else{
             palette_index = 0;
           }
+          EEPROM.write(2, palette_index);
+          EEPROM.commit();
           Serial.print("palette index: ");
           Serial.println(palette_index);
         }
         //if animation is running, only update the left led array
-        if(short_press3 == false){
-          if(mode_animation_started == true){
-            mode_palette_control(1);
-          }
-          else{
-          mode_palette_control(0);
-          }
-        }
         
+        if(mode_animation_started == true){
+          mode_palette_control(1);
+          mode_animation(current_mode);
+        }
+        else{
+          mode_palette_control(0);
+        }
       break;
 
       default:
         Serial.println("exit first touch B010 menu");
-        mode_control_flag = false;
         first_touch_val = 0;
         first_touch_flag = true;
+        initial_clear = false;
         if(mode_animation_started){
-          vTaskSuspend(mode_animation_handle);
           mode_animation_started = false;
           xTimerStop(mode_animation_timer,0);
           Serial.println("mode animation stopped");
@@ -967,11 +981,6 @@ void touch_func(void* parameters){
         if(hue_timer_change_peiod_flag == true){
           xTimerChangePeriod(hue_timer, pdTICKS_TO_MS(80), 0);
           hue_timer_change_peiod_flag = false;
-        }
-        if(wave_frame_timer_period_change_flag == true){
-          xTimerChangePeriod(wave_frame_timer, pdMS_TO_TICKS(65),0);
-          wave_frame_timer_period_change_flag = false;
-          Serial.println("wave timer 65");
         }
  
       break;
@@ -1033,7 +1042,11 @@ void touch_func(void* parameters){
     default:
       first_touch_val = 0;
       first_touch_flag = true;
-      vTaskPrioritySet(NULL, 1);
+      if(uxTaskPriorityGet(NULL) != 1){
+        vTaskPrioritySet(NULL, 1);
+        Serial.println("touch func priority lowered");
+      }
+      
     break;
     }
     
@@ -1064,21 +1077,18 @@ void touch_func(void* parameters){
         }
       suspend_flag = false;
       }
-    
-    //FastLED.show();
-      
     }
-    vTaskDelay(5/portTICK_PERIOD_MS);
+    vTaskDelay(1/portTICK_PERIOD_MS);
   }
 }
 void wave_frame_callback(TimerHandle_t pxTimer){
   shift_frame = true;
-  //Serial.println("wave timer tick");
+  Serial.println("wave timer tick");
 }
 
 void mode_animation_callback(TimerHandle_t pxTimer){
- vTaskSuspend(mode_animation_handle);
  mode_animation_started = false;
+ initial_clear = false;
  Serial.println("mode animation timeout");
 }
 
@@ -1328,6 +1338,10 @@ void wave_vis(void* parameters){
     CRGB (*p_leds)[num_leds];
     p_leds = leds;
 
+    if(wave_frame_timer_flag == false){
+      xTimerStart(wave_frame_timer,0);
+      wave_frame_timer_flag = true;
+    }
     if(xQueueReceive(fft_out_queue, (void *)&processed_buf_received, 0) == pdPASS){
       //Serial.println("processed output received");
       // standard 10 band visualizer output 
@@ -1354,7 +1368,6 @@ void wave_vis(void* parameters){
       }
       if(shift_frame){
         shift_frame = false;
-        xTimerStart(wave_frame_timer,0);
         for(uint8_t i=0; i<2; i++){
           for(uint8_t j=9; j>0; j--){
             p_peak_column_height[i][j]= p_peak_column_height[i][j-1];
@@ -1382,12 +1395,26 @@ void wave_vis(void* parameters){
 }
 
 void setup(){
+  
   fft_in_queue = xQueueCreate(2, sizeof(spi_out));
   fft_out_queue = xQueueCreate(2,sizeof(fft_out));
 
   Serial.begin(115200);
-  pinMode(relay_pin, OUTPUT); 
-  pinMode(33, INPUT);
+  pinMode(relay_pin, OUTPUT);
+
+   // initialize EEPROM memory size of 3 bytes;
+  if(!EEPROM.begin(3)){
+    Serial.println("failed to initialize EEPROM"); 
+    delay(999999);
+  }
+  else{
+    Serial.println("EEPROM initialized successfully");
+  }
+
+  //read the data stored in EEPROM
+  brightness = EEPROM.read(0);
+  current_mode = EEPROM.read(1);
+  palette_index = EEPROM.read(2);
 
   vspi = new SPIClass(VSPI);
   vspi->begin(VSPI_SCLK, VSPI_MISO, VSPI_MOSI, VSPI_CS);
@@ -1416,11 +1443,9 @@ void setup(){
   xTaskCreatePinnedToCore(spi,"spi",6000,NULL,1,&spi_handle,1);
   xTaskCreate(fft, "fft", 6200, NULL, 1, &fft_handle);
   xTaskCreate(normal_vis,"normal_vis",2000,NULL,1,&normal_vis_handle);
-  xTaskCreate(touch_func,"touch_func", 1500, NULL, 1, &ISR_handler_handle);
+  xTaskCreate(touch_func,"touch_func", 5000, NULL, 1, &ISR_handler_handle);
   xTaskCreate(wave_vis, "wave_vis", 1500, NULL, 1, &wave_vis_handle);
-  xTaskCreate(mode_animation, "mode_animations", 2000, NULL, 1, &mode_animation_handle);
 
-  vTaskSuspend(mode_animation_handle);
   vTaskSuspend(wave_vis_handle);
 
   // create timers to manage time routine tasks
@@ -1430,7 +1455,7 @@ void setup(){
   hue_timer = xTimerCreate("hue_timer", pdMS_TO_TICKS(80), pdTRUE, (void*)4, hue_callback);
   mapping_decay_timer = xTimerCreate("mapping_decay", pdMS_TO_TICKS(250), pdTRUE, (void*)5, mapping_decay_callback);
   peak_decay_timer = xTimerCreate("peak_decay_timer", pdMS_TO_TICKS(70), pdTRUE, (void*)6, peak_decay_callback);
-  wave_frame_timer = xTimerCreate("wave_frame_timer", pdMS_TO_TICKS(65), pdFALSE, (void*)7, wave_frame_callback);
+  wave_frame_timer = xTimerCreate("wave_frame_timer", pdMS_TO_TICKS(70), pdTRUE, (void*)7, wave_frame_callback);
   mode_animation_timer = xTimerCreate("mode_animation_timer", pdTICKS_TO_MS(3000), pdFALSE, (void*)8, mode_animation_callback);
   mode_animation_random_timer = xTimerCreate("mode_animation_random_timer", pdTICKS_TO_MS(250), pdFALSE,(void*)9,mode_animation_random_callback);
 
@@ -1439,7 +1464,7 @@ void setup(){
   xTimerStart(mapping_decay_timer, 0);
   xTimerStart(peak_decay_timer, 0);
 
-  vTaskDelete(NULL);
+  //vTaskDelete(NULL);
 }
 
 void loop(){
